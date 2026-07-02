@@ -1,11 +1,15 @@
 use std::{
     cmp::Ordering,
     env, fs, io,
-    os::raw::{c_char, c_int, c_long},
+    os::raw::c_int,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::raw::{c_char, c_long};
+
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Tm {
@@ -22,8 +26,29 @@ struct Tm {
     tm_zone: *const c_char,
 }
 
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Tm {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+}
+
+#[cfg(unix)]
 unsafe extern "C" {
     fn localtime_r(timep: *const c_long, result: *mut Tm) -> *mut Tm;
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _localtime64_s(result: *mut Tm, timep: *const i64) -> c_int;
 }
 
 #[derive(Debug, Default)]
@@ -449,13 +474,24 @@ fn format_time(time: Option<SystemTime>) -> String {
         return "before epoch".to_string();
     };
 
-    let Ok(seconds) = c_long::try_from(duration.as_secs()) else {
+    let Ok(seconds) = i64::try_from(duration.as_secs()) else {
         return "out of range".to_string();
     };
 
     let mut local = Tm::default();
+    #[cfg(unix)]
     let local = unsafe {
+        let Ok(seconds) = c_long::try_from(seconds) else {
+            return "out of range".to_string();
+        };
         if localtime_r(&seconds, &mut local).is_null() {
+            return "invalid time".to_string();
+        }
+        local
+    };
+    #[cfg(windows)]
+    let local = unsafe {
+        if _localtime64_s(&mut local, &seconds) != 0 {
             return "invalid time".to_string();
         }
         local
