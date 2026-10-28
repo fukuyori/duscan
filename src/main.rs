@@ -1,11 +1,15 @@
 use std::{
     cmp::Ordering,
     env, fs, io,
-    os::raw::{c_char, c_int, c_long},
+    os::raw::c_int,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::raw::{c_char, c_long};
+
+#[cfg(unix)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Tm {
@@ -22,8 +26,29 @@ struct Tm {
     tm_zone: *const c_char,
 }
 
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Tm {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+}
+
+#[cfg(unix)]
 unsafe extern "C" {
     fn localtime_r(timep: *const c_long, result: *mut Tm) -> *mut Tm;
+}
+
+#[cfg(windows)]
+unsafe extern "C" {
+    fn _localtime64_s(result: *mut Tm, timep: *const i64) -> c_int;
 }
 
 #[derive(Debug, Default)]
@@ -50,25 +75,6 @@ impl Usage {
             });
         }
     }
-
-    fn merge(&mut self, other: Usage) {
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.files += other.files;
-
-        if let Some(oldest) = other.oldest {
-            self.oldest = Some(match self.oldest {
-                Some(current) => current.min(oldest),
-                None => oldest,
-            });
-        }
-
-        if let Some(newest) = other.newest {
-            self.newest = Some(match self.newest {
-                Some(current) => current.max(newest),
-                None => newest,
-            });
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -85,8 +91,9 @@ struct Config {
     order: SortOrder,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SortKey {
+    None,
     Size,
     Files,
     Newest,
@@ -121,7 +128,7 @@ fn parse_args() -> Result<Config, String> {
     let mut index = 0;
     let mut target = None;
     let mut depth = 1;
-    let mut sort = SortKey::Size;
+    let mut sort = SortKey::None;
     let mut order = SortOrder::Desc;
 
     while index < args.len() {
@@ -131,6 +138,10 @@ fn parse_args() -> Result<Config, String> {
         match arg_string.as_ref() {
             "-h" | "--help" => {
                 print_usage();
+                std::process::exit(0);
+            }
+            "-v" | "--version" => {
+                println!("duscan {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-d" | "--depth" => {
@@ -212,12 +223,13 @@ fn parse_depth(value: &str) -> Result<usize, String> {
 
 fn parse_sort_key(value: &str) -> Result<SortKey, String> {
     match value {
+        "none" => Ok(SortKey::None),
         "size" => Ok(SortKey::Size),
         "files" => Ok(SortKey::Files),
         "newest" => Ok(SortKey::Newest),
         "oldest" => Ok(SortKey::Oldest),
         _ => Err(format!(
-            "error: invalid sort key: {value} (expected size, files, newest, or oldest)"
+            "error: invalid sort key: {value} (expected none, size, files, newest, or oldest)"
         )),
     }
 }
@@ -233,21 +245,35 @@ fn parse_sort_order_optional(value: &str) -> Option<SortOrder> {
 fn default_order(sort: SortKey) -> SortOrder {
     match sort {
         SortKey::Oldest => SortOrder::Asc,
-        SortKey::Size | SortKey::Files | SortKey::Newest => SortOrder::Desc,
+        SortKey::None | SortKey::Size | SortKey::Files | SortKey::Newest => SortOrder::Desc,
     }
 }
 
 fn print_usage() {
-    eprintln!("usage: duscan [--depth N] [--sort size|files|newest|oldest [asc|desc]] [PATH]");
+    eprintln!(
+        "usage: duscan [--depth N] [--sort none|size|files|newest|oldest [asc|desc]] [-v] [PATH]"
+    );
+    eprintln!("       (default: none, results are streamed out as they are found)");
 }
 
 fn run(config: &Config) -> io::Result<()> {
+    if config.sort == SortKey::None {
+        print_header();
+        let mut sink = |row: Row| print_row(&row);
+        collect_rows(&config.target, &config.target, 1, config.depth, &mut sink)?;
+        return Ok(());
+    }
+
     let mut rows = Vec::new();
-    collect_rows(&config.target, &config.target, 1, config.depth, &mut rows)?;
+    let mut sink = |row: Row| rows.push(row);
+    collect_rows(&config.target, &config.target, 1, config.depth, &mut sink)?;
 
     sort_rows(&mut rows, config.sort, config.order);
 
-    print_rows(&rows);
+    print_header();
+    for row in &rows {
+        print_row(row);
+    }
     Ok(())
 }
 
@@ -259,6 +285,7 @@ fn sort_rows(rows: &mut [Row], sort: SortKey, order: SortOrder) {
 
 fn compare_rows(left: &Row, right: &Row, sort: SortKey, order: SortOrder) -> Ordering {
     match sort {
+        SortKey::None => Ordering::Equal,
         SortKey::Size => compare_values(left.usage.bytes, right.usage.bytes, order),
         SortKey::Files => compare_values(left.usage.files, right.usage.files, order),
         SortKey::Newest => compare_times(left.usage.newest, right.usage.newest, order),
@@ -286,12 +313,12 @@ fn compare_times(
     }
 }
 
-fn collect_rows(
+fn collect_rows<F: FnMut(Row)>(
     target: &Path,
     path: &Path,
     current_depth: usize,
     max_depth: usize,
-    rows: &mut Vec<Row>,
+    sink: &mut F,
 ) -> io::Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = match entry {
@@ -313,16 +340,16 @@ fn collect_rows(
 
         if metadata.is_dir() && current_depth < max_depth {
             if is_empty_dir(&path) {
-                rows.push(row_for_path(target, &path));
+                sink(row_for_path(target, &path));
             } else if let Err(error) =
-                collect_rows(target, &path, current_depth + 1, max_depth, rows)
+                collect_rows(target, &path, current_depth + 1, max_depth, sink)
             {
                 eprintln!("warning: failed to read {}: {error}", path.display());
             }
             continue;
         }
 
-        rows.push(row_for_path(target, &path));
+        sink(row_for_path(target, &path));
     }
 
     Ok(())
@@ -346,56 +373,55 @@ fn is_empty_dir(path: &Path) -> bool {
 }
 
 fn scan_path(path: &Path) -> Usage {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            eprintln!("warning: failed to read {}: {error}", path.display());
-            return Usage::default();
-        }
-    };
-
-    if metadata.is_file() {
-        let mut usage = Usage::default();
-        usage.add_file(metadata.len(), metadata.modified().ok());
-        return usage;
-    }
-
-    if metadata.is_dir() {
-        return scan_dir(path);
-    }
-
-    Usage::default()
-}
-
-fn scan_dir(path: &Path) -> Usage {
     let mut usage = Usage::default();
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("warning: failed to read {}: {error}", path.display());
-            return usage;
-        }
-    };
+    let mut stack = vec![path.to_path_buf()];
 
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
+    while let Some(current) = stack.pop() {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
             Err(error) => {
-                eprintln!(
-                    "warning: failed to read an entry under {}: {error}",
-                    path.display()
-                );
+                eprintln!("warning: failed to read {}: {error}", current.display());
                 continue;
             }
         };
 
-        usage.merge(scan_path(&entry.path()));
+        if metadata.is_file() {
+            usage.add_file(metadata.len(), metadata.modified().ok());
+            continue;
+        }
+
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("warning: failed to read {}: {error}", current.display());
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to read an entry under {}: {error}",
+                        current.display()
+                    );
+                    continue;
+                }
+            };
+
+            stack.push(entry.path());
+        }
     }
 
     usage
 }
 
-fn print_rows(rows: &[Row]) {
+fn print_header() {
     let terminal_width = env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -407,17 +433,24 @@ fn print_rows(rows: &[Row]) {
         "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
         "PATH", "SIZE", "FILES", "OLDEST", "NEWEST"
     );
+}
 
-    for row in rows {
-        println!(
-            "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
-            truncate(&row.name, name_width),
-            format_bytes(row.usage.bytes),
-            row.usage.files,
-            format_time(row.usage.oldest),
-            format_time(row.usage.newest)
-        );
-    }
+fn print_row(row: &Row) {
+    let terminal_width = env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    let fixed_width = 14 + 12 + 23 + 23 + 4;
+    let name_width = terminal_width.saturating_sub(fixed_width).clamp(8, 40);
+
+    println!(
+        "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
+        truncate(&row.name, name_width),
+        format_bytes(row.usage.bytes),
+        row.usage.files,
+        format_time(row.usage.oldest),
+        format_time(row.usage.newest)
+    );
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -456,13 +489,22 @@ fn format_time(time: Option<SystemTime>) -> String {
         return "before epoch".to_string();
     };
 
-    let Ok(seconds) = c_long::try_from(duration.as_secs()) else {
+    let Ok(seconds) = i64::try_from(duration.as_secs()) else {
         return "out of range".to_string();
     };
 
     let mut local = Tm::default();
+    #[cfg(unix)]
     let local = unsafe {
+        let seconds = seconds as c_long;
         if localtime_r(&seconds, &mut local).is_null() {
+            return "invalid time".to_string();
+        }
+        local
+    };
+    #[cfg(windows)]
+    let local = unsafe {
+        if _localtime64_s(&mut local, &seconds) != 0 {
             return "invalid time".to_string();
         }
         local
