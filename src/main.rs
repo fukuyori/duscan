@@ -80,6 +80,7 @@ impl Usage {
 #[derive(Debug)]
 struct Row {
     name: String,
+    is_dir: bool,
     usage: Usage,
 }
 
@@ -258,9 +259,19 @@ fn print_usage() {
 
 fn run(config: &Config) -> io::Result<()> {
     if config.sort == SortKey::None {
+        let mut rows = Vec::new();
         print_header();
-        let mut sink = |row: Row| print_row(&row);
+        let mut sink = |row: Row| rows.push(row);
         collect_rows(&config.target, &config.target, 1, config.depth, &mut sink)?;
+        rows.sort_by(|left, right| {
+            right
+                .is_dir
+                .cmp(&left.is_dir)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        for row in &rows {
+            print_row(row);
+        }
         return Ok(());
     }
 
@@ -279,7 +290,11 @@ fn run(config: &Config) -> io::Result<()> {
 
 fn sort_rows(rows: &mut [Row], sort: SortKey, order: SortOrder) {
     rows.sort_by(|left, right| {
-        compare_rows(left, right, sort, order).then_with(|| left.name.cmp(&right.name))
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| compare_rows(left, right, sort, order))
+            .then_with(|| left.name.cmp(&right.name))
     });
 }
 
@@ -340,7 +355,7 @@ fn collect_rows<F: FnMut(Row)>(
 
         if metadata.is_dir() && current_depth < max_depth {
             if is_empty_dir(&path) {
-                sink(row_for_path(target, &path));
+                sink(row_for_path(target, &path, true));
             } else if let Err(error) =
                 collect_rows(target, &path, current_depth + 1, max_depth, sink)
             {
@@ -349,13 +364,13 @@ fn collect_rows<F: FnMut(Row)>(
             continue;
         }
 
-        sink(row_for_path(target, &path));
+        sink(row_for_path(target, &path, metadata.is_dir()));
     }
 
     Ok(())
 }
 
-fn row_for_path(target: &Path, path: &Path) -> Row {
+fn row_for_path(target: &Path, path: &Path, is_dir: bool) -> Row {
     let name = path
         .strip_prefix(target)
         .unwrap_or(path)
@@ -363,7 +378,11 @@ fn row_for_path(target: &Path, path: &Path) -> Row {
         .into_owned();
     let usage = scan_path(path);
 
-    Row { name, usage }
+    Row {
+        name,
+        is_dir,
+        usage,
+    }
 }
 
 fn is_empty_dir(path: &Path) -> bool {
@@ -422,35 +441,64 @@ fn scan_path(path: &Path) -> Usage {
 }
 
 fn print_header() {
-    let terminal_width = env::var("COLUMNS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(100);
-    let fixed_width = 14 + 12 + 23 + 23 + 4;
-    let name_width = terminal_width.saturating_sub(fixed_width).clamp(8, 40);
+    let (_, name_width) = column_widths();
+    let size_width = 14;
 
     println!(
-        "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
-        "PATH", "SIZE", "FILES", "OLDEST", "NEWEST"
+        "{:<name_width$} {:>size_width$} {:>12} {:<23} {:<23}",
+        "PATH",
+        "SIZE (KiB)",
+        "FILES",
+        "OLDEST",
+        "NEWEST",
+        size_width = size_width
     );
 }
 
 fn print_row(row: &Row) {
+    let (_, name_width) = column_widths();
+    let size_width = 14;
+    let plain_path = truncate(&row.name, name_width);
+    let path = if use_color() {
+        if row.is_dir {
+            format!("\x1b[34m{plain_path}\x1b[0m")
+        } else {
+            plain_path.clone()
+        }
+    } else {
+        plain_path.clone()
+    };
+    let padding = " ".repeat(name_width.saturating_sub(plain_path.chars().count()));
+
+    println!(
+        "{}{} {:>size_width$} {:>12} {:<23} {:<23}",
+        path,
+        padding,
+        format_kib(row.usage.bytes),
+        if row.is_dir {
+            row.usage.files.to_string()
+        } else {
+            String::new()
+        },
+        format_time(row.usage.oldest),
+        format_time(row.usage.newest),
+        size_width = size_width
+    );
+}
+
+fn use_color() -> bool {
+    env::var_os("NO_COLOR").is_none() && env::var_os("TERM").is_some_and(|term| term != "dumb")
+}
+
+fn column_widths() -> (usize, usize) {
     let terminal_width = env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(100);
-    let fixed_width = 14 + 12 + 23 + 23 + 4;
+    let size_width = 14;
+    let fixed_width = size_width + 12 + 23 + 23 + 4;
     let name_width = terminal_width.saturating_sub(fixed_width).clamp(8, 40);
-
-    println!(
-        "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
-        truncate(&row.name, name_width),
-        format_bytes(row.usage.bytes),
-        row.usage.files,
-        format_time(row.usage.oldest),
-        format_time(row.usage.newest)
-    );
+    (terminal_width, name_width)
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -463,21 +511,21 @@ fn truncate(value: &str, width: usize) -> String {
     output
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
+fn format_kib(bytes: u64) -> String {
+    let tenths = (bytes as u128 * 10).div_ceil(1024);
+    let whole = tenths / 10;
+    let fraction = tenths % 10;
+    let digits = whole.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 2);
 
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
     }
 
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    format!("{grouped}.{fraction}")
 }
 
 fn format_time(time: Option<SystemTime>) -> String {

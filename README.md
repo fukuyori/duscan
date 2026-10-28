@@ -48,6 +48,12 @@ Default sort orders:
 cargo build --release
 ```
 
+## Releases
+
+Push a version tag such as `v0.4.0` to build ZIP archives and publish a GitHub Release.
+Archives are provided for Linux x86_64, Windows x86_64, macOS Apple silicon, and macOS Intel.
+Each archive contains the executable, this README, and the Apache 2.0 license.
+
 ## License
 
 Licensed under the Apache License, Version 2.0.
