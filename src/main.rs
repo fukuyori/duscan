@@ -396,15 +396,22 @@ fn scan_dir(path: &Path) -> Usage {
 }
 
 fn print_rows(rows: &[Row]) {
+    let terminal_width = env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    let fixed_width = 14 + 12 + 23 + 23 + 4;
+    let name_width = terminal_width.saturating_sub(fixed_width).clamp(8, 40);
+
     println!(
-        "{:<40} {:>14} {:>12} {:<23} {:<23}",
+        "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
         "PATH", "SIZE", "FILES", "OLDEST", "NEWEST"
     );
 
     for row in rows {
         println!(
-            "{:<40} {:>14} {:>12} {:<23} {:<23}",
-            truncate(&row.name, 40),
+            "{:<name_width$} {:>14} {:>12} {:<23} {:<23}",
+            truncate(&row.name, name_width),
             format_bytes(row.usage.bytes),
             row.usage.files,
             format_time(row.usage.oldest),
@@ -414,12 +421,12 @@ fn print_rows(rows: &[Row]) {
 }
 
 fn truncate(value: &str, width: usize) -> String {
-    let mut output = String::new();
-
-    for ch in value.chars().take(width) {
-        output.push(ch);
+    if value.chars().count() <= width {
+        return value.to_string();
     }
 
+    let mut output: String = value.chars().take(width.saturating_sub(3)).collect();
+    output.push_str("...");
     output
 }
 
